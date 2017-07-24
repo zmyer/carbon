@@ -1,8 +1,12 @@
 import time
+import socket
+import sys
 
 from twisted.internet.protocol import ServerFactory, DatagramProtocol
 from twisted.application.internet import TCPServer, UDPServer
+from twisted.application import service
 from twisted.internet.error import ConnectionDone
+from twisted.internet import reactor, tcp, udp
 from twisted.protocols.basic import LineOnlyReceiver, Int32StringReceiver
 from twisted.protocols.policies import TimeoutMixin
 from carbon import log, events, state, management
@@ -10,6 +14,7 @@ from carbon.conf import settings
 from carbon.regexlist import WhiteList, BlackList
 from carbon.util import pickle, get_unpickler
 from carbon.util import PluginRegistrar
+from six import with_metaclass
 
 
 class CarbonReceiverFactory(ServerFactory):
@@ -23,8 +28,45 @@ class CarbonReceiverFactory(ServerFactory):
       return None
 
 
-class CarbonServerProtocol(object):
-  __metaclass__ = PluginRegistrar
+class CarbonService(service.Service):
+    """creates our own socket to support SO_REUSEPORT
+    to be removed when twisted supports it natively
+    see https://github.com/twisted/twisted/pull/759
+    """
+    factory = None
+    protocol = None
+
+    def __init__(self, interface, port, protocol, factory):
+        self.protocol = protocol
+        self.factory = factory
+        self.interface = interface
+        self.port = port
+
+    def startService(self):
+        # use socket creation from twisted to use the same options as before
+        if hasattr(self.protocol, 'datagramReceived'):
+            tmp_port = udp.Port(None, None)
+        else:
+            tmp_port = tcp.Port(None, None)
+        carbon_sock = tmp_port.createInternetSocket()
+        if hasattr(socket, "SO_REUSEPORT"):
+            carbon_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        carbon_sock.bind((self.interface, self.port))
+
+        if hasattr(self.protocol, 'datagramReceived'):
+            self._port = reactor.adoptDatagramPort(
+                carbon_sock.fileno(), socket.AF_INET, self.protocol())
+        else:
+            carbon_sock.listen(tmp_port.backlog)
+            self._port = reactor.adoptStreamPort(
+                carbon_sock.fileno(), socket.AF_INET, self.factory)
+        carbon_sock.close()
+
+    def stopService(self):
+        self._port.stopListening()
+
+
+class CarbonServerProtocol(with_metaclass(PluginRegistrar, object)):
   plugins = {}
 
   @classmethod
@@ -38,13 +80,12 @@ class CarbonServerProtocol(object):
       return
 
     if hasattr(protocol, 'datagramReceived'):
-      service = UDPServer(port, protocol(), interface=interface)
-      service.setServiceParent(root_service)
+      service = CarbonService(interface, port, protocol, None)
     else:
       factory = CarbonReceiverFactory()
       factory.protocol = protocol
-      service = TCPServer(port, factory, interface=interface)
-      service.setServiceParent(root_service)
+      service = CarbonService(interface, port, protocol, factory)
+    service.setServiceParent(root_service)
 
 
 class MetricReceiver(CarbonServerProtocol, TimeoutMixin):
@@ -104,23 +145,29 @@ class MetricReceiver(CarbonServerProtocol, TimeoutMixin):
       return
     if int(datapoint[0]) == -1:  # use current time if none given: https://github.com/graphite-project/carbon/issues/54
       datapoint = (time.time(), datapoint[1])
-
+    res = settings.MIN_TIMESTAMP_RESOLUTION
+    if res:
+      datapoint = (int(datapoint[0]) // res * res, datapoint[1])
     events.metricReceived(metric, datapoint)
     self.resetTimeout()
 
 
 class MetricLineReceiver(MetricReceiver, LineOnlyReceiver):
   plugin_name = "line"
-  delimiter = '\n'
+  delimiter = b'\n'
 
   def lineReceived(self, line):
+    if sys.version_info >= (3, 0):
+      line = line.decode('utf-8')
+
     try:
       metric, value, timestamp = line.strip().split()
       datapoint = (float(timestamp), float(value))
     except ValueError:
       if len(line) > 400:
         line = line[:400] + '...'
-      log.listener('invalid line received from client %s, ignoring [%s]' % (self.peerName, line.strip().encode('string_escape')))
+      log.listener('invalid line received from client %s, ignoring [%s]' %
+                   (self.peerName, repr(line.strip())[1:-1]))
       return
 
     self.metricReceived(metric, datapoint)
@@ -136,7 +183,11 @@ class MetricDatagramReceiver(MetricReceiver, DatagramProtocol):
 
     super(MetricDatagramReceiver, cls).build(root_service)
 
-  def datagramReceived(self, data, (host, port)):
+  def datagramReceived(self, data, addr):
+    (host, _) = addr
+    if sys.version_info >= (3, 0):
+      data = data.decode('utf-8')
+
     for line in data.splitlines():
       try:
         metric, value, timestamp = line.strip().split()
@@ -146,7 +197,8 @@ class MetricDatagramReceiver(MetricReceiver, DatagramProtocol):
       except ValueError:
         if len(line) > 400:
           line = line[:400] + '...'
-        log.listener('invalid line received from %s, ignoring [%s]' % (host, line.strip().encode('string_escape')))
+        log.listener('invalid line received from %s, ignoring [%s]' %
+                     (host, repr(line.strip())[1:-1]))
 
 
 class MetricPickleReceiver(MetricReceiver, Int32StringReceiver):
@@ -160,20 +212,26 @@ class MetricPickleReceiver(MetricReceiver, Int32StringReceiver):
   def stringReceived(self, data):
     try:
       datapoints = self.unpickler.loads(data)
-    except pickle.UnpicklingError:
+    # Pickle can throw a wide range of exceptions
+    except (pickle.UnpicklingError, ValueError, IndexError, ImportError, KeyError):
       log.listener('invalid pickle received from %s, ignoring' % self.peerName)
       return
 
     for raw in datapoints:
       try:
         (metric, (value, timestamp)) = raw
-      except Exception, e:
+      except Exception as e:
         log.listener('Error decoding pickle: %s' % e)
+        continue
 
       try:
         datapoint = (float(value), float(timestamp))  # force proper types
       except ValueError:
         continue
+
+      # convert python2 unicode objects to str/bytes
+      if not isinstance(metric, str):
+        metric = metric.encode('utf-8')
 
       self.metricReceived(metric, datapoint)
 
@@ -195,9 +253,10 @@ class CacheManagementHandler(Int32StringReceiver):
 
   def stringReceived(self, rawRequest):
     request = self.unpickler.loads(rawRequest)
+    cache = MetricCache()
     if request['type'] == 'cache-query':
       metric = request['metric']
-      datapoints = MetricCache.get(metric, {}).items()
+      datapoints = list(cache.get(metric, {}).items())
       result = dict(datapoints=datapoints)
       if settings.LOG_CACHE_HITS:
         log.query('[%s] cache query for \"%s\" returned %d values' % (self.peerAddr, metric, len(datapoints)))
@@ -207,7 +266,7 @@ class CacheManagementHandler(Int32StringReceiver):
       datapointsByMetric = {}
       metrics = request['metrics']
       for metric in metrics:
-        datapointsByMetric[metric] = MetricCache.get(metric, {}).items()
+        datapointsByMetric[metric] = list(cache.get(metric, {}).items())
 
       result = dict(datapointsByMetric=datapointsByMetric)
 
@@ -226,7 +285,7 @@ class CacheManagementHandler(Int32StringReceiver):
     else:
       result = dict(error="Invalid request type \"%s\"" % request['type'])
 
-    response = pickle.dumps(result, protocol=-1)
+    response = pickle.dumps(result, protocol=2)
     self.sendString(response)
 
 

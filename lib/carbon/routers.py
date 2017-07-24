@@ -1,11 +1,12 @@
 import imp
 from carbon.hashing import ConsistentHashRing
 from carbon.util import PluginRegistrar
+from six import with_metaclass
+from six.moves import xrange
 
 
-class DatapointRouter(object):
+class DatapointRouter(with_metaclass(PluginRegistrar, object)):
   "Abstract base class for datapoint routing logic implementations"
-  __metaclass__ = PluginRegistrar
   plugins = {}
 
   def addDestination(self, destination):
@@ -15,6 +16,14 @@ class DatapointRouter(object):
   def removeDestination(self, destination):
     "destination is a (host, port, instance) triple"
     raise NotImplemented()
+
+  def hasDestination(self, destination):
+    "destination is a (host, port, instance) triple"
+    raise NotImplemented
+
+  def countDestinations(self):
+    "return number of configured destinations"
+    raise NotImplemented
 
   def getDestinations(self, key):
     """Generate the destinations where the given routing key should map to. Only
@@ -42,6 +51,12 @@ class RelayRulesRouter(DatapointRouter):
   def removeDestination(self, destination):
     self.destinations.discard(destination)
 
+  def hasDestination(self, destination):
+    return destination in self.destinations
+
+  def countDestinations(self):
+    return len(self.destinations)
+
   def getDestinations(self, key):
     for rule in self.rules:
       if rule.matches(key):
@@ -66,17 +81,24 @@ class ConsistentHashingRouter(DatapointRouter):
 
   def addDestination(self, destination):
     (server, port, instance) = destination
-    if (server, instance) in self.instance_ports:
+    if self.hasDestination(destination):
       raise Exception("destination instance (%s, %s) already configured" % (server, instance))
     self.instance_ports[(server, instance)] = port
     self.ring.add_node((server, instance))
 
   def removeDestination(self, destination):
     (server, port, instance) = destination
-    if (server, instance) not in self.instance_ports:
+    if not self.hasDestination(destination):
       raise Exception("destination instance (%s, %s) not configured" % (server, instance))
     del self.instance_ports[(server, instance)]
     self.ring.remove_node((server, instance))
+
+  def hasDestination(self, destination):
+    (server, _, instance) = destination
+    return (server, instance) in self.instance_ports
+
+  def countDestinations(self):
+    return len(self.instance_ports)
 
   def getDestinations(self, metric):
     key = self.getKey(metric)
@@ -113,6 +135,7 @@ class ConsistentHashingRouter(DatapointRouter):
     keyfunc = getattr(module, func_name)
     self.setKeyFunction(keyfunc)
 
+
 class AggregatedConsistentHashingRouter(DatapointRouter):
   plugin_name = 'aggregated-consistent-hashing'
 
@@ -130,6 +153,12 @@ class AggregatedConsistentHashingRouter(DatapointRouter):
 
   def removeDestination(self, destination):
     self.hash_router.removeDestination(destination)
+
+  def hasDestination(self, destination):
+    return self.hash_router.hasDestination(destination)
+
+  def countDestinations(self):
+    return self.hash_router.countDestinations()
 
   def getDestinations(self, key):
     # resolve metric to aggregate forms

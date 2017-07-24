@@ -53,8 +53,12 @@ if settings.MAX_UPDATES_PER_SECOND != float('inf'):
 def optimalWriteOrder():
   """Generates metrics with the most cached values first and applies a soft
   rate limit on new metrics"""
-  while MetricCache:
-    (metric, datapoints) = MetricCache.drain_metric()
+  cache = MetricCache()
+  while cache:
+    (metric, datapoints) = cache.drain_metric()
+    if metric is None:
+        break
+
     dbFileExists = state.database.exists(metric)
 
     if not dbFileExists and CREATE_BUCKET:
@@ -75,7 +79,8 @@ def optimalWriteOrder():
 def writeCachedDataPoints():
   "Write datapoints until the MetricCache is completely empty"
 
-  while MetricCache:
+  cache = MetricCache()
+  while cache:
     dataWritten = False
 
     for (metric, datapoints, dbFileExists) in optimalWriteOrder():
@@ -87,25 +92,29 @@ def writeCachedDataPoints():
 
         for schema in SCHEMAS:
           if schema.matches(metric):
-            log.creates('new metric %s matched schema %s' % (metric, schema.name))
+            if settings.LOG_CREATES:
+              log.creates('new metric %s matched schema %s' % (metric, schema.name))
             archiveConfig = [archive.getTuple() for archive in schema.archives]
             break
 
         for schema in AGGREGATION_SCHEMAS:
           if schema.matches(metric):
-            log.creates('new metric %s matched aggregation schema %s' % (metric, schema.name))
+            if settings.LOG_CREATES:
+              log.creates('new metric %s matched aggregation schema %s'
+                          % (metric, schema.name))
             xFilesFactor, aggregationMethod = schema.archives
             break
 
         if not archiveConfig:
           raise Exception("No storage schema matched the metric '%s', check your storage-schemas.conf file." % metric)
 
-        log.creates("creating database metric %s (archive=%s xff=%s agg=%s)" %
-                    (metric, archiveConfig, xFilesFactor, aggregationMethod))
+        if settings.LOG_CREATES:
+          log.creates("creating database metric %s (archive=%s xff=%s agg=%s)" %
+                      (metric, archiveConfig, xFilesFactor, aggregationMethod))
         try:
             state.database.create(metric, archiveConfig, xFilesFactor, aggregationMethod)
             instrumentation.increment('creates')
-        except Exception, e:
+        except Exception as e:
             log.err()
             log.msg("Error creating %s: %s" % (metric, e))
             instrumentation.increment('errors')
@@ -121,7 +130,7 @@ def writeCachedDataPoints():
         datapoints = dict(datapoints).items()
         state.database.write(metric, datapoints)
         updateTime = time.time() - t1
-      except Exception, e:
+      except Exception as e:
         log.err()
         log.msg("Error writing to %s: %s" % (metric, e))
         instrumentation.increment('errors')
@@ -134,7 +143,7 @@ def writeCachedDataPoints():
 
     # Avoid churning CPU when only new metrics are in the cache
     if not dataWritten:
-      time.sleep(0.1)
+      time.sleep(1)
 
 
 def writeForever():
@@ -143,14 +152,18 @@ def writeForever():
       writeCachedDataPoints()
     except Exception:
       log.err()
-    time.sleep(1)  # The writer thread only sleeps when the cache is empty or an error occurs
+      # Back-off on error to let time to the backend to recover.
+      time.sleep(0.1)
+    else:
+      # Avoid churning CPU when there are no metrics are in the cache
+      time.sleep(1)
 
 
 def reloadStorageSchemas():
   global SCHEMAS
   try:
     SCHEMAS = loadStorageSchemas()
-  except Exception, e:
+  except Exception as e:
     log.msg("Failed to reload storage SCHEMAS: %s" % (e))
 
 
@@ -158,7 +171,7 @@ def reloadAggregationSchemas():
   global AGGREGATION_SCHEMAS
   try:
     AGGREGATION_SCHEMAS = loadAggregationSchemas()
-  except Exception, e:
+  except Exception as e:
     log.msg("Failed to reload aggregation SCHEMAS: %s" % (e))
 
 
@@ -172,6 +185,9 @@ def shutdownModifyUpdateSpeed():
         log.msg("Carbon shutting down.  Changed the update rate to: " + str(settings.MAX_UPDATES_PER_SECOND_ON_SHUTDOWN))
     except KeyError:
         log.msg("Carbon shutting down.  Update rate not changed")
+
+    # Also set MIN_TIMESTAMP_LAG to 0 to avoid waiting for nothing.
+    settings.MIN_TIMESTAMP_LAG = 0
 
 
 class WriterService(Service):

@@ -27,6 +27,20 @@ from carbon.pipeline import Processor, run_pipeline, run_pipeline_generated
 state.events = events
 state.instrumentation = instrumentation
 
+# Import plugins.
+try:
+  import carbon.manhole
+except ImportError:
+  pass
+try:
+  import carbon.amqp_listener
+except ImportError:
+  pass
+try:
+  import carbon.protobuf
+except ImportError as e:
+  pass
+
 
 class CarbonRootService(MultiService):
   """Root Service that properly configures twistd logging"""
@@ -58,6 +72,7 @@ def createBaseService(config, settings):
 
 def setupPipeline(pipeline, root_service, settings):
   state.pipeline_processors = []
+
   for processor in pipeline:
     args = []
     if ':' in processor:
@@ -78,7 +93,7 @@ def setupPipeline(pipeline, root_service, settings):
     plugin_class = Processor.plugins[processor]
     state.pipeline_processors.append(plugin_class(*args))
 
-    if processor == 'relay':
+    if processor in ['relay', 'write']:
       state.pipeline_processors_generated.append(plugin_class(*args))
 
 
@@ -108,11 +123,24 @@ def createAggregatorService(config):
 
   settings.RELAY_METHOD = 'consistent-hashing'
   root_service = createBaseService(config, settings)
-  setupPipeline(['rewrite:pre', 'aggregate', 'rewrite:post', 'relay'], root_service, settings)
+  setupPipeline(
+    ['rewrite:pre', 'aggregate', 'rewrite:post', 'relay'],
+    root_service, settings)
   setupReceivers(root_service, settings)
 
   return root_service
 
+def createAggregatorCacheService(config):
+  from carbon.conf import settings
+
+  settings.RELAY_METHOD = 'consistent-hashing'
+  root_service = createBaseService(config, settings)
+  setupPipeline(
+    ['rewrite:pre', 'aggregate', 'rewrite:post', 'write'],
+    root_service, settings)
+  setupReceivers(root_service, settings)
+
+  return root_service
 
 def createRelayService(config):
   from carbon.conf import settings
